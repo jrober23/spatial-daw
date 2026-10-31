@@ -1,0 +1,34 @@
+[package]
+name = "spatial-daw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A DAW with a Gibson-inspired 3D spatial mixer"
+
+[[bin]]
+name = "spatial-daw"
+path = "src/main.rs"
+
+[features]
+default = []
+# Opt-in ASIO support. Requires the Steinberg ASIO SDK; see docs/ASIO.md.
+asio = ["daw-engine/asio"]
+
+[dependencies]
+daw-core = { path = "../daw-core" }
+daw-engine = { path = "../daw-engine" }
+eframe = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+wgpu = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }
+rfd = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+anyhow = { workspace = true }

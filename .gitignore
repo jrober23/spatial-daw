@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+*.pdb
+*.msi
+*.dmg
+*.sdaw.tmp
+*.sdaw.media/
+.DS_Store
+.idea/
+.vscode/
+.scratch/
+.env
+.env.*
+!.env.example
