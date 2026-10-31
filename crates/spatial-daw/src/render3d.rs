@@ -57,6 +57,20 @@ impl Camera {
         ))
     }
 
+    /// Camera-right in world space. Used to estimate a sphere's on-screen
+    /// radius for hit-testing and selection rings.
+    pub fn right(&self) -> Vec3 {
+        let forward = (-self.eye()).normalize();
+        forward.cross(Vec3::Y).normalize()
+    }
+
+    pub fn project_radius(&self, center: Vec3, radius: f32, rect: Rect) -> Option<f32> {
+        let edge = center + self.right() * (radius * 1.25);
+        let center_screen = self.project(center, rect)?;
+        let edge_screen = self.project(edge, rect)?;
+        Some(center_screen.distance(edge_screen).max(3.0))
+    }
+
     pub fn orbit(&mut self, dx: f32, dy: f32) {
         self.yaw -= dx * 0.008;
         self.pitch = (self.pitch + dy * 0.006).clamp(-1.45, 1.45);
@@ -303,7 +317,7 @@ impl Mixer3D {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_sphere"),
+                entry_point: Some("fs_ghost"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
@@ -640,6 +654,32 @@ fn room_lines() -> (Vec<LineVertex>, u32) {
         Vec3::new(6.0, 3.0, 6.0),
         shell,
     );
+
+    // Log-frequency shelves on the back and side walls, so height reads as a
+    // frequency scale rather than an arbitrary vertical axis.
+    for hz in [100.0_f32, 1_000.0, 10_000.0] {
+        let t = ((hz.ln() - 20.0_f32.ln()) / (20_000.0_f32.ln() - 20.0_f32.ln())).clamp(0.0, 1.0);
+        let y = floor + t * 6.0;
+        let color = [0.28, 0.42, 0.48, 0.46];
+        push_line(
+            &mut lines,
+            Vec3::new(-6.0, y, -6.0),
+            Vec3::new(6.0, y, -6.0),
+            color,
+        );
+        push_line(
+            &mut lines,
+            Vec3::new(-6.0, y, -6.0),
+            Vec3::new(-6.0, y, 6.0),
+            color,
+        );
+        push_line(
+            &mut lines,
+            Vec3::new(6.0, y, -6.0),
+            Vec3::new(6.0, y, 6.0),
+            color,
+        );
+    }
 
     // Pan axis (red), frequency axis (green), depth axis (blue).
     push_line(

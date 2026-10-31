@@ -43,18 +43,34 @@ fn vs_sphere(@builtin(vertex_index) index: u32, instance: SphereIn) -> SphereOut
 @fragment
 fn fs_sphere(input: SphereOut) -> @location(0) vec4<f32> {
     let radius_sq = dot(input.uv, input.uv);
-    if (radius_sq > 1.0) {
+    let coverage = 1.0 - smoothstep(0.78, 1.0, radius_sq);
+    if (coverage <= 0.01) {
         discard;
     }
     let z = sqrt(max(0.0, 1.0 - radius_sq));
     let normal = normalize(vec3<f32>(input.uv.x, -input.uv.y, z));
     let light = normalize(vec3<f32>(-0.45, 0.65, 0.85));
+    let half_dir = normalize(light + vec3<f32>(0.0, 0.0, 1.0));
     let diffuse = max(dot(normal, light), 0.0);
+    let specular = pow(max(dot(normal, half_dir), 0.0), 30.0);
     let rim = pow(1.0 - z, 2.2);
-    let shade = 0.28 + diffuse * 0.8 + rim * 0.35;
+    let shade = 0.24 + diffuse * 0.82 + rim * 0.28;
     let fog = clamp(1.0 - (input.depth - 9.0) / 34.0, 0.2, 1.0);
-    let alpha = input.color.a * (0.65 + rim * 0.35);
-    return vec4<f32>(input.color.rgb * shade * fog, alpha);
+    let alpha = input.color.a * coverage * (0.68 + rim * 0.32);
+    let rgb = input.color.rgb * shade * fog + vec3<f32>(1.0) * specular * 0.32 * fog;
+    return vec4<f32>(rgb, alpha);
+}
+
+@fragment
+fn fs_ghost(input: SphereOut) -> @location(0) vec4<f32> {
+    let radius_sq = dot(input.uv, input.uv);
+    if (radius_sq > 1.0) {
+        discard;
+    }
+    let ring = smoothstep(0.58, 0.86, radius_sq) * (1.0 - smoothstep(0.90, 1.0, radius_sq));
+    let halo = (1.0 - smoothstep(0.72, 0.96, radius_sq)) * 0.08;
+    let alpha = clamp(input.color.a * (0.28 + ring * 2.3 + halo), 0.0, 1.0);
+    return vec4<f32>(mix(input.color.rgb, vec3<f32>(1.0), ring * 0.28), alpha);
 }
 
 struct LineIn {

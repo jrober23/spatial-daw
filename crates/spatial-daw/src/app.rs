@@ -28,6 +28,7 @@ use egui::{
     pos2, vec2, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui,
 };
 use egui_wgpu::wgpu;
+use glam::Vec3;
 
 use crate::render3d::{world_position, Camera, Mixer3D, Scene, Sphere};
 
@@ -50,6 +51,12 @@ enum DragMode {
     TrimRight,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NoteDragMode {
+    Move,
+    Resize,
+}
+
 #[derive(Clone, Copy)]
 struct ClipDrag {
     track: TrackId,
@@ -67,9 +74,47 @@ struct NoteDrag {
     track: TrackId,
     pattern: PatternId,
     note: NoteId,
+    mode: NoteDragMode,
     pointer: Pos2,
     start: i64,
     pitch: u8,
+}
+
+struct SpatialMarker {
+    track: TrackId,
+    sphere: Sphere,
+    target: Option<Sphere>,
+    role: ElementRole,
+    score: f32,
+    measured_hz: f32,
+}
+
+fn dashed_line(painter: &egui::Painter, a: Pos2, b: Pos2, stroke: Stroke, dash: f32, gap: f32) {
+    let delta = b - a;
+    let length = delta.length();
+    if length < 0.5 {
+        return;
+    }
+    let direction = delta / length;
+    let mut t = 0.0;
+    while t < length {
+        let end = (t + dash).min(length);
+        painter.line_segment([a + direction * t, a + direction * end], stroke);
+        t += dash + gap;
+    }
+}
+
+fn draw_tag(painter: &egui::Painter, pos: Pos2, text: &str, color: Color32) {
+    let size = vec2(text.len() as f32 * 5.6 + 6.0, 14.0);
+    let rect = Rect::from_center_size(pos, size);
+    painter.rect_filled(rect, CornerRadius::same(3), Color32::from_black_alpha(155));
+    painter.text(
+        pos,
+        Align2::CENTER_CENTER,
+        text,
+        FontId::monospace(9.0),
+        color,
+    );
 }
 
 #[derive(Default)]
@@ -119,6 +164,7 @@ pub struct App {
     camera: Camera,
     show_targets: bool,
     spatial_drag: Option<TrackId>,
+    scrollbar_drag: Option<f32>,
     analysis: MixAnalysis,
     auto_follow: bool,
     last_device: String,
@@ -180,6 +226,7 @@ impl App {
             camera: Camera::default(),
             show_targets: true,
             spatial_drag: None,
+            scrollbar_drag: None,
             analysis: MixAnalysis::default(),
             auto_follow: true,
             last_device: String::new(),
@@ -1267,21 +1314,17 @@ impl App {
             let timeline_rect =
                 Rect::from_min_max(pos2(timeline_left, rect.top() + RULER_H), rect.max);
             if response.hovered() {
-                let (scroll, shift) = ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.shift));
-                if shift {
+                let (scroll, shift, ctrl) =
+                    ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.shift, i.modifiers.ctrl));
+                if ctrl {
+                    if scroll != 0.0 {
+                        self.px_per_bar =
+                            (self.px_per_bar * (1.0 + scroll * 0.002)).clamp(24.0, 900.0);
+                    }
+                } else if shift {
                     self.scroll_x = (self.scroll_x - scroll).max(0.0);
                 } else {
                     self.scroll_y = (self.scroll_y - scroll).max(0.0);
-                }
-                let zoom = ui.input(|i| {
-                    if i.modifiers.ctrl {
-                        i.smooth_scroll_delta.y
-                    } else {
-                        0.0
-                    }
-                });
-                if zoom.abs() > 0.0 {
-                    self.px_per_bar = (self.px_per_bar * (1.0 + zoom * 0.002)).clamp(24.0, 900.0);
                 }
             }
             let bar_ticks = self.project.time_signature.ticks_per_bar().max(1) as f32;
@@ -1598,10 +1641,45 @@ impl App {
                     }
                 }
             }
+            // Bottom scrollbar. Keep its geometry around so the main
+            // interaction response can drive it without a second widget.
+            let bar = Rect::from_min_size(
+                pos2(timeline_left, rect.bottom() - 8.0),
+                vec2(rect.width() - HEADER_W, 6.0),
+            );
+            let total_bars = (self.project.timeline_end_ticks() as f32 / bar_ticks).max(8.0);
+            let content_w = total_bars * self.px_per_bar;
+            let scroll_max = (content_w - bar.width()).max(0.0);
+            let thumb_w = if content_w > bar.width() {
+                (bar.width() * (bar.width() / content_w)).max(30.0)
+            } else {
+                bar.width()
+            };
+            let thumb_x =
+                bar.left() + (bar.width() - thumb_w) * (self.scroll_x / scroll_max.max(1.0));
+            let thumb_rect =
+                Rect::from_min_size(pos2(thumb_x, bar.top()), vec2(thumb_w, bar.height()));
+            painter.rect_filled(bar, CornerRadius::same(3), Color32::from_rgb(28, 34, 43));
+            if content_w > bar.width() {
+                painter.rect_filled(
+                    thumb_rect,
+                    CornerRadius::same(3),
+                    if self.scrollbar_drag.is_some() {
+                        Color32::from_rgb(115, 145, 175)
+                    } else {
+                        Color32::from_rgb(80, 100, 125)
+                    },
+                );
+            }
+
             // Interaction.
             if response.clicked() {
                 if let Some(pos) = response.interact_pointer_pos() {
-                    if pos.y < rect.top() + RULER_H && pos.x > timeline_left {
+                    if bar.expand2(vec2(0.0, 4.0)).contains(pos) && scroll_max > 0.0 {
+                        let track_w = (bar.width() - thumb_w).max(1.0);
+                        let target = (pos.x - bar.left() - thumb_w * 0.5) / track_w;
+                        self.scroll_x = target.clamp(0.0, 1.0) * scroll_max;
+                    } else if pos.y < rect.top() + RULER_H && pos.x > timeline_left {
                         self.seek(self.tick_from_x(pos.x, timeline_left));
                     } else if pos.x < timeline_left {
                         let mut row_top = rect.top() + RULER_H - self.scroll_y;
@@ -1612,11 +1690,15 @@ impl App {
                                 vec2(HEADER_W, track.height),
                             );
                             if row.contains(pos) {
-                                clicked = Some((
-                                    track.id,
-                                    pos.x < row.left() + 32.0 && pos.y < row.top() + 28.0,
-                                    pos.x < row.left() + 55.0 && pos.y < row.top() + 28.0,
-                                ));
+                                let mute = Rect::from_min_size(
+                                    pos2(row.left() + 12.0, row.top() + 8.0),
+                                    vec2(18.0, 17.0),
+                                );
+                                let solo = Rect::from_min_size(
+                                    pos2(row.left() + 34.0, row.top() + 8.0),
+                                    vec2(18.0, 17.0),
+                                );
+                                clicked = Some((track.id, mute.contains(pos), solo.contains(pos)));
                                 break;
                             }
                             row_top += track.height + ROW_GAP;
@@ -1648,7 +1730,18 @@ impl App {
             }
             if response.drag_started() {
                 if let Some(pos) = response.interact_pointer_pos() {
-                    if pos.y > rect.top() + RULER_H {
+                    if bar.expand2(vec2(0.0, 4.0)).contains(pos) && scroll_max > 0.0 {
+                        let offset = if thumb_rect.contains(pos) {
+                            pos.x - thumb_x
+                        } else {
+                            thumb_w * 0.5
+                        };
+                        self.scrollbar_drag = Some(offset);
+                        let track_w = (bar.width() - thumb_w).max(1.0);
+                        let target = (pos.x - offset - bar.left()) / track_w;
+                        self.scroll_x = target.clamp(0.0, 1.0) * scroll_max;
+                        self.drag = None;
+                    } else if pos.y > rect.top() + RULER_H {
                         if let Some((track, clip, mode)) = self.clip_at(pos, rect) {
                             let Some((clip_start, offset, length_frames, length_ticks)) = self
                                 .project
@@ -1690,31 +1783,19 @@ impl App {
                 }
             }
             if response.dragged() {
-                if let Some(pos) = response.interact_pointer_pos() {
+                if let Some(offset) = self.scrollbar_drag {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let track_w = (bar.width() - thumb_w).max(1.0);
+                        let target = (pos.x - offset - bar.left()) / track_w;
+                        self.scroll_x = target.clamp(0.0, 1.0) * scroll_max;
+                    }
+                } else if let Some(pos) = response.interact_pointer_pos() {
                     self.apply_clip_drag(pos, ptt);
                 }
             }
             if response.drag_stopped() {
                 self.drag = None;
-            }
-            // Bottom scrollbar.
-            let bar = Rect::from_min_size(
-                pos2(timeline_left, rect.bottom() - 8.0),
-                vec2(rect.width() - HEADER_W, 6.0),
-            );
-            painter.rect_filled(bar, CornerRadius::same(3), Color32::from_rgb(28, 34, 43));
-            let total_bars = (self.project.timeline_end_ticks() as f32 / bar_ticks).max(8.0);
-            let content_w = total_bars * self.px_per_bar;
-            if content_w > bar.width() {
-                let thumb_w = (bar.width() * (bar.width() / content_w)).max(30.0);
-                let thumb_x = bar.left()
-                    + (bar.width() - thumb_w)
-                        * (self.scroll_x / (content_w - bar.width()).max(1.0));
-                painter.rect_filled(
-                    Rect::from_min_size(pos2(thumb_x, bar.top()), vec2(thumb_w, bar.height())),
-                    CornerRadius::same(3),
-                    Color32::from_rgb(80, 100, 125),
-                );
+                self.scrollbar_drag = None;
             }
         });
     }
@@ -1924,6 +2005,7 @@ impl App {
                 bar += 1;
             }
             let mut hover_note: Option<NoteId> = None;
+            let mut hover_resize = false;
             let pointer = response.interact_pointer_pos();
             for note in &pattern.notes {
                 if note.pitch < low || note.pitch > high {
@@ -1943,11 +2025,24 @@ impl App {
                         Color32::from_rgb(105, 200, 160)
                     },
                 );
+                painter.rect_filled(
+                    Rect::from_min_size(pos2(nr.right() - 2.0, nr.top()), vec2(2.0, nr.height())),
+                    CornerRadius::ZERO,
+                    if selected {
+                        Color32::from_rgb(20, 70, 55)
+                    } else {
+                        Color32::from_rgba_unmultiplied(10, 40, 30, 180)
+                    },
+                );
                 if let Some(p) = pointer {
                     if nr.contains(p) {
                         hover_note = Some(note.id);
+                        hover_resize = nr.right() - p.x <= 5.0;
                     }
                 }
+            }
+            if hover_resize {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             }
             if response.drag_started() {
                 if let Some(pos) = response.interact_pointer_pos() {
@@ -1959,6 +2054,11 @@ impl App {
                                     track: track_id,
                                     pattern: pattern_id,
                                     note: note_id,
+                                    mode: if hover_resize {
+                                        NoteDragMode::Resize
+                                    } else {
+                                        NoteDragMode::Move
+                                    },
                                     pointer: pos,
                                     start: note.start,
                                     pitch: note.pitch,
@@ -1971,23 +2071,39 @@ impl App {
             }
             if response.dragged() {
                 if let (Some(drag), Some(pos)) = (self.note_drag, response.interact_pointer_pos()) {
-                    let delta_ticks = ((pos.x - drag.pointer.x) / px.max(0.0001)) as i64;
-                    let new_start = snap_tick(
-                        drag.start + delta_ticks,
-                        self.project.snap,
-                        self.project.time_signature,
-                    )
-                    .max(0);
-                    let row = ((pos.y - grid.top()) / row_h).floor() as i32;
-                    let new_pitch = (high as i32 - row).clamp(low as i32, high as i32) as u8;
-                    if let Some(note) = self
-                        .project
-                        .track_mut(drag.track)
-                        .and_then(|t| t.pattern_mut(drag.pattern))
-                        .and_then(|p| p.notes.iter_mut().find(|n| n.id == drag.note))
-                    {
-                        note.start = new_start;
-                        note.pitch = new_pitch;
+                    if drag.mode == NoteDragMode::Resize {
+                        let end = snap_tick(
+                            ((pos.x - grid.left()) / px.max(0.0001)) as i64,
+                            self.project.snap,
+                            self.project.time_signature,
+                        );
+                        if let Some(note) = self
+                            .project
+                            .track_mut(drag.track)
+                            .and_then(|t| t.pattern_mut(drag.pattern))
+                            .and_then(|p| p.notes.iter_mut().find(|n| n.id == drag.note))
+                        {
+                            note.length = (end - note.start).max(30);
+                        }
+                    } else {
+                        let delta_ticks = ((pos.x - drag.pointer.x) / px.max(0.0001)) as i64;
+                        let new_start = snap_tick(
+                            drag.start + delta_ticks,
+                            self.project.snap,
+                            self.project.time_signature,
+                        )
+                        .max(0);
+                        let row = ((pos.y - grid.top()) / row_h).floor() as i32;
+                        let new_pitch = (high as i32 - row).clamp(low as i32, high as i32) as u8;
+                        if let Some(note) = self
+                            .project
+                            .track_mut(drag.track)
+                            .and_then(|t| t.pattern_mut(drag.pattern))
+                            .and_then(|p| p.notes.iter_mut().find(|n| n.id == drag.note))
+                        {
+                            note.start = new_start;
+                            note.pitch = new_pitch;
+                        }
                     }
                     self.touch();
                 }
@@ -1998,24 +2114,28 @@ impl App {
             if response.clicked() {
                 if let Some(pos) = response.interact_pointer_pos() {
                     if grid.contains(pos) {
-                        self.push_undo();
-                        let tick = snap_tick(
-                            ((pos.x - grid.left()) / px.max(0.0001)) as i64,
-                            self.project.snap,
-                            self.project.time_signature,
-                        );
-                        let row = ((pos.y - grid.top()) / row_h).floor() as i32;
-                        let pitch = (high as i32 - row).clamp(low as i32, high as i32) as u8;
-                        if let Some(id) = self.project.add_note(
-                            track_id,
-                            pattern_id,
-                            pitch,
-                            tick,
-                            self.project.snap.ticks(self.project.time_signature).max(60),
-                            100,
-                        ) {
-                            self.selected_note = Some((track_id, pattern_id, id));
-                            self.touch();
+                        if let Some(note_id) = hover_note {
+                            self.selected_note = Some((track_id, pattern_id, note_id));
+                        } else {
+                            self.push_undo();
+                            let tick = snap_tick(
+                                ((pos.x - grid.left()) / px.max(0.0001)) as i64,
+                                self.project.snap,
+                                self.project.time_signature,
+                            );
+                            let row = ((pos.y - grid.top()) / row_h).floor() as i32;
+                            let pitch = (high as i32 - row).clamp(low as i32, high as i32) as u8;
+                            if let Some(id) = self.project.add_note(
+                                track_id,
+                                pattern_id,
+                                pitch,
+                                tick,
+                                self.project.snap.ticks(self.project.time_signature).max(60),
+                                100,
+                            ) {
+                                self.selected_note = Some((track_id, pattern_id, id));
+                                self.touch();
+                            }
                         }
                     }
                 }
@@ -2206,7 +2326,7 @@ impl App {
             }
             ui.label(
                 egui::RichText::new(
-                    "Drag a sphere: X pan / Y fader · drag empty: orbit · wheel: zoom",
+                    "Drag sphere: pan ↔ / level ↕ · drag empty: orbit · wheel: zoom",
                 )
                 .small()
                 .color(Color32::from_gray(140)),
@@ -2219,7 +2339,7 @@ impl App {
 
         let analysis = self.analysis.clone();
         let mut scene = Scene::default();
-        let mut labels: Vec<(TrackId, Sphere)> = Vec::new();
+        let mut markers: Vec<SpatialMarker> = Vec::new();
         for ta in &analysis.tracks {
             let Some(track) = self.project.track(ta.track) else {
                 continue;
@@ -2235,18 +2355,30 @@ impl App {
                 radius: 0.26 + ta.actual_size * 0.95,
                 color,
             };
-            scene.spheres.push(sphere);
-            labels.push((ta.track, sphere));
-            if self.show_targets {
-                if let Some(target) = ta.target {
+            let ghost = if self.show_targets {
+                ta.target.map(|target| {
                     let position = target.position();
-                    scene.ghosts.push(Sphere {
+                    Sphere {
                         center: world_position(position.pan, position.height(), position.depth),
                         radius: 0.22 + target.size() * 0.95,
                         color: [color[0], color[1], color[2], 0.18],
-                    });
-                }
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(ghost) = ghost {
+                scene.ghosts.push(ghost);
             }
+            scene.spheres.push(sphere);
+            markers.push(SpatialMarker {
+                track: ta.track,
+                sphere,
+                target: ghost,
+                role: ta.role,
+                score: ta.score,
+                measured_hz: ta.measured_hz,
+            });
         }
 
         let texture = if let Some(render_state) = frame.wgpu_render_state() {
@@ -2276,7 +2408,8 @@ impl App {
             // 2D fallback seen when wgpu is not available.
             let cx = rect.center().x;
             let cy = rect.center().y;
-            for (index, (track_id, sphere)) in labels.iter().enumerate() {
+            for (index, marker) in markers.iter().enumerate() {
+                let sphere = marker.sphere;
                 let x = cx + (sphere.center.x / 6.0) * rect.width() * 0.8;
                 let y = cy + (sphere.center.z / 6.0) * rect.height() * 0.7;
                 let radius = 5.0 + sphere.radius * 8.0;
@@ -2292,7 +2425,7 @@ impl App {
                 );
                 let name = self
                     .project
-                    .track(*track_id)
+                    .track(marker.track)
                     .map(|t| t.name.clone())
                     .unwrap_or_else(|| index.to_string());
                 painter.text(
@@ -2304,34 +2437,242 @@ impl App {
                 );
             }
         }
-        // Labels and selection ring overlay.
-        for (track_id, sphere) in &labels {
-            if let Some(pos) = self.camera.project(sphere.center, rect) {
-                let selected = self.selected_track == Some(*track_id);
-                if selected {
-                    painter.circle_stroke(pos, 11.0, Stroke::new(1.5, Color32::WHITE));
+
+        let pan_color = Color32::from_rgb(225, 110, 110);
+        let freq_color = Color32::from_rgb(115, 205, 150);
+        let depth_color = Color32::from_rgb(110, 170, 240);
+        for (world, text, color) in [
+            (Vec3::new(-6.1, -2.85, 0.0), "L", pan_color),
+            (Vec3::new(6.1, -2.85, 0.0), "R", pan_color),
+            (Vec3::new(0.0, -2.85, -6.1), "FAR", depth_color),
+            (Vec3::new(0.0, -2.85, 6.1), "NEAR", depth_color),
+            (Vec3::new(0.0, -2.98, 0.0), "LOW", freq_color),
+            (Vec3::new(0.0, 3.0, 0.0), "HIGH", freq_color),
+        ] {
+            if let Some(pos) = self.camera.project(world, rect) {
+                if rect.shrink(8.0).contains(pos) {
+                    draw_tag(&painter, pos, text, color);
                 }
-                let name = self
-                    .project
-                    .track(*track_id)
-                    .map(|t| t.name.clone())
-                    .unwrap_or_default();
-                painter.text(
-                    pos + vec2(10.0, -8.0),
-                    Align2::LEFT_CENTER,
-                    name,
-                    FontId::proportional(10.0),
-                    Color32::from_gray(225),
-                );
             }
         }
+        for (hz, label) in [
+            (100.0_f32, "100 Hz"),
+            (1_000.0, "1 kHz"),
+            (10_000.0, "10 kHz"),
+        ] {
+            let y = -3.0 + gibson::frequency_to_height(hz) * 6.0;
+            if let Some(pos) = self.camera.project(Vec3::new(-6.05, y, -6.0), rect) {
+                if rect.shrink(8.0).contains(pos) {
+                    draw_tag(&painter, pos, label, Color32::from_gray(135));
+                }
+            }
+        }
+
+        // Tether each element to its reference target so the coaching image is
+        // readable without having to match colours by eye.
+        for marker in &markers {
+            if let Some(target) = marker.target {
+                if let (Some(from), Some(to)) = (
+                    self.camera.project(marker.sphere.center, rect),
+                    self.camera.project(target.center, rect),
+                ) {
+                    let selected = self.selected_track == Some(marker.track);
+                    let stroke = if selected {
+                        Stroke::new(1.4, Color32::from_rgba_unmultiplied(220, 235, 245, 130))
+                    } else {
+                        Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 175, 215, 55))
+                    };
+                    dashed_line(&painter, from, to, stroke, 5.0, 5.0);
+                    if let Some(radius) =
+                        self.camera
+                            .project_radius(target.center, target.radius, rect)
+                    {
+                        painter.circle_stroke(
+                            to,
+                            radius + 2.0,
+                            Stroke::new(
+                                if selected { 1.2 } else { 0.8 },
+                                Color32::from_rgba_unmultiplied(
+                                    200,
+                                    225,
+                                    245,
+                                    if selected { 120 } else { 45 },
+                                ),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        let hover_pos = response.hover_pos();
+        let hit = hover_pos.and_then(|pos| {
+            markers
+                .iter()
+                .enumerate()
+                .filter_map(|(index, marker)| {
+                    let screen = self.camera.project(marker.sphere.center, rect)?;
+                    let radius = self
+                        .camera
+                        .project_radius(marker.sphere.center, marker.sphere.radius, rect)
+                        .unwrap_or(10.0)
+                        .max(12.0);
+                    let distance = screen.distance(pos);
+                    (distance <= radius + 7.0).then_some((index, distance))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(index, _)| index)
+        });
+
+        let mut label_screens: Vec<(usize, Pos2, f32, String, bool)> = markers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, marker)| {
+                let screen = self.camera.project(marker.sphere.center, rect)?;
+                let radius = self
+                    .camera
+                    .project_radius(marker.sphere.center, marker.sphere.radius, rect)
+                    .unwrap_or(10.0);
+                let name = self
+                    .project
+                    .track(marker.track)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default();
+                Some((
+                    index,
+                    screen,
+                    radius,
+                    name,
+                    self.selected_track == Some(marker.track),
+                ))
+            })
+            .collect();
+        label_screens.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
+        let mut occupied: Vec<Rect> = Vec::new();
+        for (_, screen, radius, name, selected) in &label_screens {
+            let screen = *screen;
+            let radius = *radius;
+            let selected = *selected;
+            if selected {
+                painter.circle_stroke(screen, radius + 3.0, Stroke::new(1.6, Color32::WHITE));
+                painter.circle_stroke(
+                    screen,
+                    radius + 6.0,
+                    Stroke::new(2.5, Color32::from_rgba_unmultiplied(255, 255, 255, 22)),
+                );
+            }
+            let width = name.chars().count() as f32 * 5.6 + 4.0;
+            let x = (screen.x + radius + 6.0)
+                .min(rect.right() - width - 4.0)
+                .max(rect.left() + 4.0);
+            let mut y = (screen.y - 8.0).clamp(rect.top() + 4.0, rect.bottom() - 16.0);
+            let mut label_rect = Rect::from_min_size(pos2(x, y), vec2(width, 12.0));
+            let mut attempts = 0;
+            while occupied.iter().any(|r| r.intersects(label_rect)) && attempts < 10 {
+                y += 13.0;
+                if y + 12.0 > rect.bottom() - 4.0 {
+                    break;
+                }
+                label_rect = Rect::from_min_size(pos2(x, y), vec2(width, 12.0));
+                attempts += 1;
+            }
+            if label_rect.top() > screen.y - 2.0 || label_rect.left() > screen.x + radius {
+                painter.line_segment(
+                    [screen, label_rect.left_center()],
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(180, 200, 220, 80)),
+                );
+            }
+            occupied.push(label_rect);
+            painter.text(
+                label_rect.min + vec2(1.0, 1.0),
+                Align2::LEFT_TOP,
+                name,
+                FontId::proportional(10.0),
+                Color32::from_black_alpha(180),
+            );
+            painter.text(
+                label_rect.min,
+                Align2::LEFT_TOP,
+                name,
+                FontId::proportional(10.0),
+                if selected {
+                    Color32::WHITE
+                } else {
+                    Color32::from_gray(225)
+                },
+            );
+        }
+
+        if self.spatial_drag.is_none() {
+            if let (Some(pointer), Some(index)) = (hover_pos, hit) {
+                if let Some(marker) = markers.get(index) {
+                    if let Some(track) = self.project.track(marker.track) {
+                        let text = format!(
+                            "{}\n{} · match {:.0}%\npan {:+.0}% · {:.1} dB\n{:.0} Hz measured",
+                            track.name,
+                            marker.role.label(),
+                            marker.score,
+                            track.pan * 100.0,
+                            track.volume_db,
+                            marker.measured_hz
+                        );
+                        let card_size = vec2(210.0, 68.0);
+                        let x = (pointer.x + 16.0)
+                            .min(rect.right() - card_size.x - 8.0)
+                            .max(rect.left() + 8.0);
+                        let y = (pointer.y + 16.0)
+                            .min(rect.bottom() - card_size.y - 8.0)
+                            .max(rect.top() + 8.0);
+                        let card = Rect::from_min_size(pos2(x, y), card_size);
+                        painter.rect_filled(
+                            card,
+                            CornerRadius::same(4),
+                            Color32::from_black_alpha(225),
+                        );
+                        painter.rect_stroke(
+                            card,
+                            CornerRadius::same(4),
+                            Stroke::new(1.0, Color32::from_rgb(70, 90, 115)),
+                            StrokeKind::Inside,
+                        );
+                        painter.text(
+                            card.min + vec2(8.0, 6.0),
+                            Align2::LEFT_TOP,
+                            text,
+                            FontId::monospace(9.5),
+                            Color32::from_gray(225),
+                        );
+                    }
+                }
+            }
+        }
+
         painter.text(
             pos2(rect.left() + 10.0, rect.bottom() - 18.0),
             Align2::LEFT_CENTER,
-            "LOW ← frequency → HIGH    ·    FRONT (near) ↘   BACK (far) ↗",
+            "Drag sphere: pan ↔ / level ↕    ·    drag empty: orbit    ·    wheel: zoom",
             FontId::monospace(9.5),
             Color32::from_gray(120),
         );
+        if rect.width() > 620.0 {
+            let y = rect.bottom() - 18.0;
+            let mut x = rect.right() - 188.0;
+            for (label, color) in [
+                ("X PAN", pan_color),
+                ("Y FREQ", freq_color),
+                ("Z DEPTH", depth_color),
+            ] {
+                painter.circle_filled(pos2(x, y), 3.0, color);
+                painter.text(
+                    pos2(x + 7.0, y),
+                    Align2::LEFT_CENTER,
+                    label,
+                    FontId::monospace(9.0),
+                    Color32::from_gray(140),
+                );
+                x += 62.0;
+            }
+        }
 
         if response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -2340,23 +2681,13 @@ impl App {
             }
         }
         if response.drag_started() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let hit = labels
-                    .iter()
-                    .filter_map(|(id, sphere)| {
-                        self.camera
-                            .project(sphere.center, rect)
-                            .map(|screen| (*id, screen.distance(pos)))
-                    })
-                    .filter(|(_, d)| *d < 26.0)
-                    .min_by(|a, b| a.1.total_cmp(&b.1));
-                if let Some((track, _)) = hit {
-                    self.push_undo();
-                    self.selected_track = Some(track);
-                    self.spatial_drag = Some(track);
-                } else {
-                    self.spatial_drag = None;
-                }
+            if let Some(index) = hit {
+                let track = markers[index].track;
+                self.push_undo();
+                self.selected_track = Some(track);
+                self.spatial_drag = Some(track);
+            } else {
+                self.spatial_drag = None;
             }
         }
         if response.dragged() {
@@ -2756,12 +3087,23 @@ impl eframe::App for App {
             self.need_snapshot = false;
         }
         if let Some(session) = &self.session {
+            // Follow the selected instrument track; if an audio track is
+            // selected, keep MIDI playable on the first instrument track.
             let target = self
-                .project
-                .tracks
-                .iter()
-                .find(|t| t.instrument.is_some())
-                .map(|t| t.id)
+                .selected_track
+                .filter(|id| {
+                    self.project
+                        .track(*id)
+                        .map(|t| t.instrument.is_some())
+                        .unwrap_or(false)
+                })
+                .or_else(|| {
+                    self.project
+                        .tracks
+                        .iter()
+                        .find(|t| t.instrument.is_some())
+                        .map(|t| t.id)
+                })
                 .unwrap_or(TrackId::NONE);
             let current = TrackId::new(session.shared.midi_target.load(Ordering::Relaxed));
             if current != target {
